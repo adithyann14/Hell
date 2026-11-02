@@ -30,6 +30,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Locate project root
+        run: |
+          if [ ! -f source/pack.py ]; then
+            root=$(find . -maxdepth 3 -path ./.git -prune -o -type f -name pack.py -path '*/source/*' -print | head -n1)
+            if [ -n "$root" ]; then
+              root=$(dirname "$(dirname "$root")")
+            else
+              echo "source/pack.py not found in checkout; cloning Adithy4n/browser"
+              git clone --depth 1 https://github.com/Adithy4n/browser.git /tmp/browser-src
+              root=/tmp/browser-src
+            fi
+            echo "Using project root: $root"
+            tar -C "$root" --exclude=.git --exclude=.github -cf - . | tar -xf -
+          fi
+          ls source
+
       - name: Shell + Python syntax
         run: |
           for f in source/*.sh; do bash -n "$f"; done
@@ -58,6 +74,22 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+
+      - name: Locate project root
+        run: |
+          if [ ! -f source/pack.py ]; then
+            root=$(find . -maxdepth 3 -path ./.git -prune -o -type f -name pack.py -path '*/source/*' -print | head -n1)
+            if [ -n "$root" ]; then
+              root=$(dirname "$(dirname "$root")")
+            else
+              echo "source/pack.py not found in checkout; cloning Adithy4n/browser"
+              git clone --depth 1 https://github.com/Adithy4n/browser.git /tmp/browser-src
+              root=/tmp/browser-src
+            fi
+            echo "Using project root: $root"
+            tar -C "$root" --exclude=.git --exclude=.github -cf - . | tar -xf -
+          fi
+          ls source
 
       - name: Download Mesa ${{ env.MESA_VERSION }}
         run: |
@@ -130,6 +162,22 @@ jobs:
       SIGNING_KEY: ${{ secrets.AERA_PLUGIN_PRIVATE_KEY }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Locate project root
+        run: |
+          if [ ! -f source/pack.py ]; then
+            root=$(find . -maxdepth 3 -path ./.git -prune -o -type f -name pack.py -path '*/source/*' -print | head -n1)
+            if [ -n "$root" ]; then
+              root=$(dirname "$(dirname "$root")")
+            else
+              echo "source/pack.py not found in checkout; cloning Adithy4n/browser"
+              git clone --depth 1 https://github.com/Adithy4n/browser.git /tmp/browser-src
+              root=/tmp/browser-src
+            fi
+            echo "Using project root: $root"
+            tar -C "$root" --exclude=.git --exclude=.github -cf - . | tar -xf -
+          fi
+          ls source
 
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y xz-utils zstd xxd
