@@ -58,8 +58,21 @@ jobs:
         run: |
           curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
           cd "mesa-${MESA_VERSION}"
-          # Same order the build scripts use: a613 -> a825 -> a722
-          for p in a613 a825 a722 zink-kgsl-surfaceless; do
+          # The a613 patch file has a hand-written hunk that does not match the
+          # real 26.2.2 source, so add the entry directly. build-turnip-a613.sh
+          # skips its own patch step when GPUId(613) is already present.
+          dev=src/freedreno/common/freedreno_devices.py
+          if ! grep -q 'GPUId(613)' "$dev"; then
+            if ! grep -q 'GPUId(612)' "$dev"; then
+              echo "::error::GPUId(612) not found; printing nearby context"
+              grep -n -B3 -A6 'a6xx_gen1_low' "$dev" || true
+              exit 1
+            fi
+            sed -i '/^[[:space:]]*GPUId(612),/a\        GPUId(613),' "$dev"
+          fi
+          grep -n -B5 -A4 'GPUId(613)' "$dev"
+          # Same order the build scripts use: (a613) -> a825 -> a722
+          for p in a825 a722 zink-kgsl-surfaceless; do
             patch --dry-run -p1 -i "../source/patches/mesa-${MESA_VERSION}-$p"*.patch
             patch -p1 -i "../source/patches/mesa-${MESA_VERSION}-$p"*.patch
           done
@@ -95,6 +108,20 @@ jobs:
         run: |
           curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
           mv "mesa-${MESA_VERSION}" mesa-src
+          cd mesa-src
+          # The a613 patch file has a hand-written hunk that does not match the
+          # real 26.2.2 source, so add the entry directly. build-turnip-a613.sh
+          # skips its own patch step when GPUId(613) is already present.
+          dev=src/freedreno/common/freedreno_devices.py
+          if ! grep -q 'GPUId(613)' "$dev"; then
+            if ! grep -q 'GPUId(612)' "$dev"; then
+              echo "::error::GPUId(612) not found; printing nearby context"
+              grep -n -B3 -A6 'a6xx_gen1_low' "$dev" || true
+              exit 1
+            fi
+            sed -i '/^[[:space:]]*GPUId(612),/a\        GPUId(613),' "$dev"
+          fi
+          grep -n -B5 -A4 'GPUId(613)' "$dev"
 
       - name: Build libvulkan_freedreno.so (Alpine / musl)
         run: |
