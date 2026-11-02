@@ -14,6 +14,11 @@ on:
         description: "Plugin version, e.g. 1.5.7 (defaults to tag name, else plugin.json)"
         required: false
         type: string
+      test_sign:
+        description: "Test build: sign plugin.json with a throwaway key (public key is uploaded)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -45,6 +50,13 @@ jobs:
             tar -C "$root" --exclude=.git --exclude=.github -cf - . | tar -xf -
           fi
           ls source
+
+      - name: Add Adreno 613 support (vanilla repo has none)
+        run: |
+          if [ ! -f source/build-turnip-a613.sh ]; then
+            test -f add-a613-support.sh || { echo "::error::add-a613-support.sh missing; commit it next to the workflow"; exit 1; }
+            bash add-a613-support.sh .
+          fi
 
       - name: Shell + Python syntax
         run: |
@@ -103,6 +115,13 @@ jobs:
             tar -C "$root" --exclude=.git --exclude=.github -cf - . | tar -xf -
           fi
           ls source
+
+      - name: Add Adreno 613 support (vanilla repo has none)
+        run: |
+          if [ ! -f source/build-turnip-a613.sh ]; then
+            test -f add-a613-support.sh || { echo "::error::add-a613-support.sh missing; commit it next to the workflow"; exit 1; }
+            bash add-a613-support.sh .
+          fi
 
       - name: Download Mesa ${{ env.MESA_VERSION }}
         run: |
@@ -214,21 +233,60 @@ jobs:
           name: turnip
           path: turnip
 
-      - name: Fetch staged runtime
+      - name: Fetch base runtime
         run: |
-          if [ -z "${STAGED_RUNTIME_URL:-}" ]; then
-            echo "::error::Set repo variable STAGED_RUNTIME_URL (or pass staged_runtime_url) to the staged ARM64 runtime tarball."
-            exit 1
-          fi
-          auth=()
-          [ -n "${STAGED_RUNTIME_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $STAGED_RUNTIME_TOKEN")
-          curl -fsSL "${auth[@]}" -o stage.tar "$STAGED_RUNTIME_URL"
           mkdir stage
-          # Symlinks (musl loader alias) must survive extraction; pack.py resolves them.
-          tar --no-same-owner -xf stage.tar -C stage
-          # If the tarball has a single top-level dir, descend into it.
-          if [ "$(ls -A stage | wc -l)" = 1 ] && [ -d "stage/$(ls stage)" ]; then
-            mv "stage/$(ls stage)" stage-root && rm -rf stage && mv stage-root stage
+          if [ -n "${STAGED_RUNTIME_URL:-}" ]; then
+            auth=()
+            [ -n "${STAGED_RUNTIME_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $STAGED_RUNTIME_TOKEN")
+            curl -fsSL "${auth[@]}" -o stage.tar "$STAGED_RUNTIME_URL"
+            # Symlinks (musl loader alias) must survive extraction; pack.py resolves them.
+            tar --no-same-owner -xf stage.tar -C stage
+            # If the tarball has a single top-level dir, descend into it.
+            if [ "$(ls -A stage | wc -l)" = 1 ] && [ -d "stage/$(ls stage)" ]; then
+              mv "stage/$(ls stage)" stage-root && rm -rf stage && mv stage-root stage
+            fi
+          else
+            # No staged tarball given: start from the currently published runtime
+            # named in plugin.json, so only the Turnip library changes.
+            url=$(python3 -c "import json;print(json.load(open('plugin.json'))['payload_url'])")
+            want=$(python3 -c "import json;print(json.load(open('plugin.json'))['payload_sha256'])")
+            echo "STAGED_RUNTIME_URL not set; using published runtime: $url"
+            curl -fsSL -o base-runtime.xz "$url"
+            echo "$want  base-runtime.xz" | sha256sum -c -
+            python3 - base-runtime.xz stage <<'PY'
+          import os, struct, subprocess, sys
+
+          src, dest = sys.argv[1], sys.argv[2]
+          raw = subprocess.run(["xz", "-dc", src], check=True, stdout=subprocess.PIPE).stdout
+          if raw[:8] != b"AERAWEB1":
+              sys.exit("not an AERA runtime payload")
+          count = struct.unpack_from("<I", raw, 8)[0]
+          pos = 12
+          root = os.path.realpath(dest)
+          for _ in range(count):
+              nlen, mode, size = struct.unpack_from("<HHQ", raw, pos)
+              pos += 12
+              name = raw[pos:pos + nlen].decode("utf-8")
+              pos += nlen
+              pos += -pos % 4
+              data = raw[pos:pos + size]
+              pos += size
+              if name.startswith("/") or any(p in ("", ".", "..") for p in name.split("/")):
+                  sys.exit(f"unsafe path in payload: {name}")
+              path = os.path.join(root, name)
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              if mode == 0:  # symlink; payload stores the target relative to the runtime root
+                  target = os.path.relpath(os.path.join(root, data.decode()), os.path.dirname(path))
+                  os.symlink(target, path)
+              else:
+                  with open(path, "wb") as f:
+                      f.write(data)
+                  os.chmod(path, mode)
+          if pos != len(raw):
+              sys.exit("trailing bytes in payload")
+          print(f"unpacked {count} members")
+          PY
           fi
 
       - name: Replace Turnip driver in staged runtime
@@ -271,8 +329,30 @@ jobs:
           PY
           cat build/plugin.json | head -20
 
+      - name: Sign plugin.json (test key, throwaway)
+        if: ${{ inputs.test_sign }}
+        run: |
+          umask 077
+          openssl genpkey -algorithm ED25519 -out "$RUNNER_TEMP/test-key.pem"
+          openssl pkey -in "$RUNNER_TEMP/test-key.pem" -pubout -out build/test-signing-public.pem
+          openssl pkeyutl -sign -rawin -inkey "$RUNNER_TEMP/test-key.pem" \
+            -in build/plugin.json -out build/plugin.json.sig.bin
+          xxd -p -c 256 build/plugin.json.sig.bin > build/plugin.json.sig
+          # Prove the signature verifies with the public key we publish.
+          xxd -r -p build/plugin.json.sig > "$RUNNER_TEMP/verify.bin"
+          openssl pkeyutl -verify -rawin -pubin -inkey build/test-signing-public.pem \
+            -in build/plugin.json -sigfile "$RUNNER_TEMP/verify.bin"
+          rm -f "$RUNNER_TEMP/test-key.pem" "$RUNNER_TEMP/verify.bin" build/plugin.json.sig.bin
+          {
+            echo "### Test-signed build"
+            echo "plugin.json was signed with a throwaway Ed25519 key. Only a recovery that trusts this public key will accept it:"
+            echo '```'
+            cat build/test-signing-public.pem
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Sign plugin.json (Ed25519)
-        if: env.SIGNING_KEY != ''
+        if: ${{ env.SIGNING_KEY != '' && !inputs.test_sign }}
         run: |
           umask 077
           printf '%s\n' "$SIGNING_KEY" > key.pem
@@ -288,12 +368,13 @@ jobs:
             build/runtime.xz
             build/plugin.json
             build/plugin.json.sig
+            build/test-signing-public.pem
             build/manifest.json
             build/aera_browser_payload.hpp
           if-no-files-found: error
 
       - name: Publish GitHub release
-        if: github.ref_type == 'tag'
+        if: ${{ github.ref_type == 'tag' && !inputs.test_sign }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
