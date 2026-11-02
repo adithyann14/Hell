@@ -1,0 +1,228 @@
+name: Build AERA Browser plugin
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      staged_runtime_url:
+        description: "URL of the staged ARM64 runtime tarball (overrides vars.STAGED_RUNTIME_URL)"
+        required: false
+        type: string
+      version:
+        description: "Plugin version, e.g. 1.5.7 (defaults to tag name, else plugin.json)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  MESA_VERSION: "26.2.2"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Cheap sanity checks: shell syntax, Python syntax, JSON validity, patch dry-run
+  # ---------------------------------------------------------------------------
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell + Python syntax
+        run: |
+          for f in source/*.sh; do bash -n "$f"; done
+          python3 -m py_compile source/pack.py
+
+      - name: plugin.json is valid JSON
+        run: python3 -m json.tool plugin.json > /dev/null
+
+      - name: Mesa patches apply to a fresh 26.2.2 tree
+        run: |
+          curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
+          cd "mesa-${MESA_VERSION}"
+          # Same order the build scripts use: a613 -> a825 -> a722
+          for p in a613 a825 a722 zink-kgsl-surfaceless; do
+            patch --dry-run -p1 -i "../source/patches/mesa-${MESA_VERSION}-$p"*.patch
+            patch -p1 -i "../source/patches/mesa-${MESA_VERSION}-$p"*.patch
+          done
+
+  # ---------------------------------------------------------------------------
+  # Build the Turnip Vulkan driver (aarch64 / musl) inside Alpine on a native
+  # ARM64 runner. This is the only component rebuilt in recent releases
+  # (1.5.5 -> 1.5.7).
+  # ---------------------------------------------------------------------------
+  turnip:
+    needs: validate
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Mesa ${{ env.MESA_VERSION }}
+        run: |
+          curl -fsSL "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz" | tar -xJ
+          mv "mesa-${MESA_VERSION}" mesa-src
+
+      - name: Build libvulkan_freedreno.so (Alpine / musl)
+        run: |
+          cat > build-in-alpine.sh <<'SCRIPT'
+          set -eux
+          apk add --no-cache \
+            bash coreutils patch grep sed curl xz git \
+            build-base linux-headers meson samurai pkgconf \
+            python3 py3-mako py3-yaml py3-packaging py3-setuptools \
+            flex bison glslang vulkan-headers \
+            zlib-dev zstd-dev expat-dev libdrm-dev libxml2-dev
+
+          cat > /tmp/cross.ini <<'EOF2'
+          [binaries]
+          c = 'gcc'
+          cpp = 'g++'
+          ar = 'ar'
+          strip = 'strip'
+          pkg-config = 'pkg-config'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = false
+          EOF2
+
+          export NINJA=samu
+          export AERA_BROWSER_JOBS="$(nproc)"
+          bash source/build-turnip-a613.sh /work/mesa-src /work/mesa-build /tmp/cross.ini
+
+          mkdir -p /work/out
+          cp /work/mesa-build/src/freedreno/vulkan/libvulkan_freedreno.so /work/out/
+          strip --strip-unneeded /work/out/libvulkan_freedreno.so
+          ls -l /work/out
+          SCRIPT
+          docker run --rm -v "$PWD":/work -w /work alpine:3.22 sh build-in-alpine.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnip
+          path: out/libvulkan_freedreno.so
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Overlay the fresh Turnip build onto the staged runtime, pack it into
+  # runtime.xz, refresh plugin.json, optionally sign it.
+  #
+  # The WPE WebKit / Mesa-EGL / worker runtime is NOT built here: it needs a
+  # patched WPE 2.52.6 tree and a custom Alpine sysroot that are not part of
+  # this repo (see source/BUILD-NOTES.md). Provide it as a tarball.
+  # ---------------------------------------------------------------------------
+  package:
+    needs: turnip
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      STAGED_RUNTIME_URL: ${{ inputs.staged_runtime_url || vars.STAGED_RUNTIME_URL }}
+      STAGED_RUNTIME_TOKEN: ${{ secrets.STAGED_RUNTIME_TOKEN }}
+      SIGNING_KEY: ${{ secrets.AERA_PLUGIN_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y xz-utils zstd xxd
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: turnip
+          path: turnip
+
+      - name: Fetch staged runtime
+        run: |
+          if [ -z "${STAGED_RUNTIME_URL:-}" ]; then
+            echo "::error::Set repo variable STAGED_RUNTIME_URL (or pass staged_runtime_url) to the staged ARM64 runtime tarball."
+            exit 1
+          fi
+          auth=()
+          [ -n "${STAGED_RUNTIME_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $STAGED_RUNTIME_TOKEN")
+          curl -fsSL "${auth[@]}" -o stage.tar "$STAGED_RUNTIME_URL"
+          mkdir stage
+          # Symlinks (musl loader alias) must survive extraction; pack.py resolves them.
+          tar --no-same-owner -xf stage.tar -C stage
+          # If the tarball has a single top-level dir, descend into it.
+          if [ "$(ls -A stage | wc -l)" = 1 ] && [ -d "stage/$(ls stage)" ]; then
+            mv "stage/$(ls stage)" stage-root && rm -rf stage && mv stage-root stage
+          fi
+
+      - name: Replace Turnip driver in staged runtime
+        run: |
+          mapfile -t hits < <(find stage -name libvulkan_freedreno.so -type f)
+          if [ "${#hits[@]}" -eq 0 ]; then
+            echo "::error::libvulkan_freedreno.so not found in staged runtime"; exit 1
+          fi
+          for h in "${hits[@]}"; do
+            echo "replacing $h"
+            install -m 0755 turnip/libvulkan_freedreno.so "$h"
+          done
+
+      - name: Pack runtime.xz
+        run: python3 source/pack.py stage build
+
+      - name: Update plugin.json
+        run: |
+          ver="${{ inputs.version }}"
+          [ -z "$ver" ] && [[ "$GITHUB_REF_NAME" == v* && "$GITHUB_REF_TYPE" == tag ]] && ver="${GITHUB_REF_NAME#v}"
+          python3 - "$ver" <<'PY'
+          import hashlib, json, os, re, sys
+          ver = sys.argv[1]
+          hpp = open("build/aera_browser_payload.hpp").read()
+          num = lambda k: int(re.search(rf"{k}\s*=\s*(\d+)", hpp).group(1))
+          txt = lambda k: re.search(rf'{k}\[\]\s*=\s*"([0-9a-f]+)"', hpp).group(1)
+          p = json.load(open("plugin.json"))
+          if ver: p["version"] = ver
+          p["payload_url"] = (f"https://github.com/{os.environ['GITHUB_REPOSITORY']}"
+                              f"/releases/download/v{p['version']}/runtime.xz")
+          p["payload_size"]    = num("kCompressedBytes")
+          p["payload_sha256"]  = txt("kCompressedHash")
+          p["expanded_size"]   = num("kExpandedBytes")
+          p["expanded_sha256"] = txt("kExpandedHash")
+          p["member_count"]    = num("kMemberCount")
+          # Cross-check against the real file
+          assert hashlib.sha256(open("build/runtime.xz","rb").read()).hexdigest() == p["payload_sha256"]
+          json.dump(p, open("build/plugin.json","w"), indent=2, ensure_ascii=False)
+          open("build/plugin.json","a").write("\n")
+          PY
+          cat build/plugin.json | head -20
+
+      - name: Sign plugin.json (Ed25519)
+        if: env.SIGNING_KEY != ''
+        run: |
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > key.pem
+          openssl pkeyutl -sign -rawin -inkey key.pem \
+            -in build/plugin.json -out build/plugin.json.sig.bin
+          xxd -p -c 256 build/plugin.json.sig.bin > build/plugin.json.sig
+          rm -f key.pem build/plugin.json.sig.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aera-browser-plugin
+          path: |
+            build/runtime.xz
+            build/plugin.json
+            build/plugin.json.sig
+            build/manifest.json
+            build/aera_browser_payload.hpp
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=(build/runtime.xz build/plugin.json)
+          [ -f build/plugin.json.sig ] && files+=(build/plugin.json.sig)
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+            --title "AERA Browser ${GITHUB_REF_NAME#v}" --generate-notes
